@@ -1,4 +1,2 @@
 cantools
-csv
-os
 tqdm
