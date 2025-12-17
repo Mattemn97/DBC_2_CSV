@@ -12,11 +12,13 @@ class ARR:
 
     def __init__(self, Id, Values, Unit):
         self.Id = Id
+        # Manteniamo il tuo formato di appiattimento
         self.Values = str(Values).replace('[', '').replace(']', '').replace('\'', '').replace(',', '')
         self.Unit = Unit
 
     def csv_str(self):
         return f"{self.Id},{self.Values},{self.Unit}"
+
 
 class VTB:
     HEADER = "ID,Descriptive_Name,Simulink_Name,ARR_ID_Input,ARR_ID_Output"
@@ -56,6 +58,7 @@ class CAN:
         self.Default_Value = Default_Value
         self.Unit = Unit
         self.SPN = SPN
+        # Appiattimento coerente con il tuo formato
         self.ECU_Receivers = str(ECU_Receivers).replace('[', '').replace(']', '').replace('\'', '').replace(',', '')
         self.ECU_Senders = str(ECU_Senders).replace('[', '').replace(']', '').replace('\'', '').replace(',', '')
         self.VTB_ID = VTB_ID
@@ -84,16 +87,19 @@ def scrittura_csv(file_path: Path, lista_elem):
     print(f"Scritto: {file_path.name}")
 
 
-def choices_key(choices: dict):
+# >>> Normalizzazione deterministica
+def normalize_choices(choices: dict):
     """
-    Rende le choices sempre hashabili, anche se contengono NamedSignalValue
+    Rende deterministica l'ordinazione: ordina per chiave numerica.
+    Restituisce lista di tuple (key_int, value_str) ordinate per key_int.
     """
-    normalized = []
+    items = []
     for k, v in choices.items():
-        # v può essere str oppure NamedSignalValue
-        value = v.name if hasattr(v, "name") else str(v)
-        normalized.append((int(k), value))
-    return tuple(sorted(normalized))
+        key_int = int(k)
+        value_str = v.name if hasattr(v, "name") else str(v)
+        items.append((key_int, value_str))
+    items.sort(key=lambda t: t[0])
+    return items
 
 
 # ============================================================
@@ -105,8 +111,10 @@ def elabora_dbc(dbc_path: Path, out_can: Path, out_vtb: Path, out_arr: Path):
     lista_VTB = []
     lista_ARR = []
 
-    vtb_cache = {}   # choices_key -> VTB_ID
-    arr_cache = {}   # choices_key -> (ARR_IN_ID, ARR_OUT_ID)
+    # >>> Cache per deduplica
+    vtb_cache = {}        # (arr_in_key, arr_out_key) -> VTB_ID
+    arr_in_cache = {}     # arr_in_key  (tuple[int]) -> ARR_IN_ID
+    arr_out_cache = {}    # arr_out_key (tuple[str]) -> ARR_OUT_ID
 
     iter_CAN = 0
     iter_VTB = 0
@@ -117,37 +125,54 @@ def elabora_dbc(dbc_path: Path, out_can: Path, out_vtb: Path, out_arr: Path):
     total_signals = sum(len(msg.signals) for msg in can_db.messages)
     print(f"📊 Trovati {len(can_db.messages)} messaggi e {total_signals} segnali.\n")
 
-    with tqdm(total=total_signals, desc="🔧 Conversione in corso", unit="segnale", dynamic_ncols=True) as pbar:
+    from tqdm import tqdm as _tqdm
+    with _tqdm(total=total_signals, desc="🔧 Conversione in corso", unit="segnale", dynamic_ncols=True) as pbar:
         for messaggio in can_db.messages:
             for segnale in messaggio.signals:
                 iter_CAN += 1
                 str_key_CAN = f"CAN_{str(iter_CAN).zfill(4)}"
                 str_key_VTB = "NA"
+                arr_in_id = "NA"
+                arr_out_id = "NA"
 
-                # ---------- VTB / ARR ottimizzati ----------
                 if segnale.choices:
-                    key = choices_key(segnale.choices)
+                    # >>> Normalizza e separa le chiavi per dedupl. ARR indipendenti
+                    items = normalize_choices(segnale.choices)
+                    arr_in_key = tuple(k for k, _ in items)         # es. (0,1,2,3)
+                    arr_out_key = tuple(v for _, v in items)        # es. ("Off","On",...)
+                    vtb_key = (arr_in_key, arr_out_key)
 
-                    if key in vtb_cache:
-                        str_key_VTB = vtb_cache[key]
+                    # --- VTB dedup ---
+                    if vtb_key in vtb_cache:
+                        str_key_VTB = vtb_cache[vtb_key]
+                        # Recupera anche gli ARR collegati (già in cache)
+                        arr_in_id = arr_in_cache[arr_in_key]
+                        arr_out_id = arr_out_cache[arr_out_key]
                     else:
+                        # --- ARR IN dedup ---
+                        if arr_in_key in arr_in_cache:
+                            arr_in_id = arr_in_cache[arr_in_key]
+                        else:
+                            iter_ARR += 1
+                            arr_in_id = f"ARR_{str(iter_ARR).zfill(4)}"
+                            # scriviamo i VALUES con l'ordine normalizzato
+                            lista_ARR.append(ARR(arr_in_id, list(arr_in_key), "NA"))
+                            arr_in_cache[arr_in_key] = arr_in_id
+
+                        # --- ARR OUT dedup ---
+                        if arr_out_key in arr_out_cache:
+                            arr_out_id = arr_out_cache[arr_out_key]
+                        else:
+                            iter_ARR += 1
+                            arr_out_id = f"ARR_{str(iter_ARR).zfill(4)}"
+                            lista_ARR.append(ARR(arr_out_id, list(arr_out_key), "NA"))
+                            arr_out_cache[arr_out_key] = arr_out_id
+
+                        # --- Crea nuova VTB (riusando eventualmente ARR) ---
                         iter_VTB += 1
                         str_key_VTB = f"VTB_{str(iter_VTB).zfill(4)}"
-
-                        iter_ARR += 1
-                        arr_in_id = f"ARR_{str(iter_ARR).zfill(4)}"
-                        iter_ARR += 1
-                        arr_out_id = f"ARR_{str(iter_ARR).zfill(4)}"
-
-                        lista_ARR.append(ARR(arr_in_id, list(segnale.choices.keys()), "NA"))
-                        lista_ARR.append(ARR(arr_out_id, list(segnale.choices.values()), "NA"))
-
-                        lista_VTB.append(
-                            VTB(str_key_VTB, "NA", "NA", arr_in_id, arr_out_id)
-                        )
-
-                        vtb_cache[key] = str_key_VTB
-                        arr_cache[key] = (arr_in_id, arr_out_id)
+                        lista_VTB.append(VTB(str_key_VTB, "NA", "NA", arr_in_id, arr_out_id))
+                        vtb_cache[vtb_key] = str_key_VTB
 
                 # ---------- CAN ----------
                 lista_CAN.append(
@@ -167,13 +192,14 @@ def elabora_dbc(dbc_path: Path, out_can: Path, out_vtb: Path, out_arr: Path):
                         getattr(segnale, "receivers", "NA"),
                         getattr(messaggio, "senders", "NA"),
                         str_key_VTB,
-                        "NA",
-                        "NA"
+                        arr_in_id,
+                        arr_out_id
                     )
                 )
 
                 pbar.update(1)
 
+    # Scrittura file
     if lista_CAN:
         scrittura_csv(out_can, lista_CAN)
     if lista_VTB:
@@ -208,7 +234,6 @@ def main():
     result = menu()
     if result is None:
         return
-
     elabora_dbc(*result)
 
 
